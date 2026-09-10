@@ -1,150 +1,308 @@
-namespace OrderService.DTOs;
+namespace SupplierInventoryService.Enums;
 
-public record OrderItemResponse(int DrugId, int Quantity, decimal UnitPriceAtOrder);
-
-
-
-
-using System.Security.Cryptography;
-using System.Text;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
-using OrderService.Auth;
-using OrderService.Clients;
-using OrderService.Data;
-using OrderService.Middleware;
-using OrderService.Repositories.Implementations;
-using OrderService.Repositories.Interfaces;
-using Microsoft.OpenApi;
-
-var builder = WebApplication.CreateBuilder(args);
-
-// ---------- EF Core ----------
-builder.Services.AddDbContext<OrdersDbContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("OrdersDb")));
-
-// ---------- Repositories ----------
-builder.Services.AddScoped<IOrderRepository, OrderRepository>();
-builder.Services.AddScoped<IPaymentIntentRepository, PaymentIntentRepository>();
-
-// ---------- Services ----------
-// Fully-qualified on the implementation side — "OrderService" is both the project's
-// root namespace and this class's name.
-builder.Services.AddScoped<IOrderService, OrderService.Services.OrderService>();
-
-// ---------- Internal service-to-service client ----------
-// Shared-key auth, not JWT-forwarding — see prior decision. Attached once here at
-// HttpClient configuration time so it works identically for controller-triggered
-// calls and background-job-triggered calls (e.g. stale-order auto-cancel).
-builder.Services.AddHttpClient<ISupplierInventoryClient, SupplierInventoryClient>(client =>
+public enum StockReservationStatus
 {
-    client.BaseAddress = new Uri(builder.Configuration["SupplierInventoryService:BaseUrl"]!);
-    client.DefaultRequestHeaders.Add("X-Internal-Api-Key", builder.Configuration["InternalApi:Key"]);
-});
-
-// ---------- JWT (RS256, validate-only — OrderService never signs) ----------
-var rsa = RSA.Create();
-rsa.ImportFromPem(builder.Configuration["Jwt:PublicKey"]!.ToCharArray());
-var signingKey = new RsaSecurityKey(rsa);
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidIssuer = builder.Configuration["Jwt:Issuer"],
-            ValidateAudience = true,
-            ValidAudience = builder.Configuration["Jwt:Audience"],
-            ValidateLifetime = true,
-            IssuerSigningKey = signingKey,
-            RoleClaimType = System.Security.Claims.ClaimTypes.Role
-        };
-
-        // Auth failures bypass GlobalExceptionMiddleware entirely (nothing is thrown),
-        // so 401/403 need their own ProblemDetails shaping — same pattern as
-        // UserAuthService/SupplierInventoryService. Duplicated across services by
-        // design-not-yet-consolidated, per the existing flag on that pattern.
-        options.Events = new JwtBearerEvents
-        {
-            OnChallenge = context =>
-            {
-                context.HandleResponse();
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                context.Response.ContentType = "application/problem+json";
-                var problem = new
-                {
-                    type = "https://tools.ietf.org/html/rfc7807",
-                    title = "Unauthorized",
-                    status = 401,
-                    detail = "A valid bearer token is required."
-                };
-                return context.Response.WriteAsJsonAsync(problem);
-            },
-            OnForbidden = context =>
-            {
-                context.Response.StatusCode = StatusCodes.Status403Forbidden;
-                context.Response.ContentType = "application/problem+json";
-                var problem = new
-                {
-                    type = "https://tools.ietf.org/html/rfc7807",
-                    title = "Forbidden",
-                    status = 403,
-                    detail = "You do not have permission to perform this action."
-                };
-                return context.Response.WriteAsJsonAsync(problem);
-            }
-        };
-    })
-    // Second scheme: authenticates OrderService's own /internal/* callers (currently
-    // none inbound — SupplierInventoryService is the one exposing /internal/*. Kept
-    // here only if OrderService ever exposes its own internal endpoints later;
-    // remove if it never does, to avoid registering an unused scheme.
-    .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(
-        ApiKeyAuthenticationOptions.SchemeName, options => { });
-
-builder.Services.AddAuthorization();
-
-// ---------- Controllers ----------
-builder.Services.AddControllers();
-
-// ---------- Swagger ----------
-// Swashbuckle 10.x-compatible syntax — Microsoft.OpenApi namespace, not
-// Microsoft.OpenApi.Models, per the breaking change already worked around
-// in UserAuthService/SupplierInventoryService.
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(options =>
-{
-    var securityScheme = new OpenApiSecurityScheme
-    {
-        Name = "Authorization",
-        Type = SecuritySchemeType.Http,
-        Scheme = "bearer",
-        BearerFormat = "JWT",
-        In = ParameterLocation.Header,
-        Description = "Enter your JWT access token."
-    };
-    options.AddSecurityDefinition("Bearer", securityScheme);
-    options.AddSecurityRequirement(document => new OpenApiSecurityRequirement
-    {
-        [new OpenApiSecuritySchemeReference("Bearer", document)] = Array.Empty<string>()
-    });
-});
-
-var app = builder.Build();
-
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    ACTIVE,
+    RELEASED,
+    COMMITTED
 }
 
-app.UseMiddleware<GlobalExceptionMiddleware>();
+using SupplierInventoryService.Enums;
 
-app.UseAuthentication();
-app.UseAuthorization();
+namespace SupplierInventoryService.Entities;
 
-app.MapControllers();
+public class StockReservation
+{
+    public int Id { get; set; }
+    public int PaymentIntentId { get; set; } // logical ref to OrdersDB
+    public int DrugId { get; set; } // FK -> Drugs, same DB
+    public int Quantity { get; set; }
+    public StockReservationStatus Status { get; set; }
+    public DateTime ReservedAt { get; set; }
+    public DateTime ExpiresAt { get; set; }
+    public Drug Drug { get; set; } = default!;
+}
 
-app.Run();
+
+
+namespace SupplierInventoryService.Entities;
+
+public class Sale
+{
+    public int Id { get; set; }
+    public int OrderId { get; set; } // unique, logical ref to OrdersDB
+    public decimal Amount { get; set; }
+    public DateTime SaleDate { get; set; }
+}
+
+
+namespace SupplierInventoryService.Entities;
+
+// PK is OrderId itself, not a separate Id — matches the locked "order_id as PK" decision.
+public class ProcessedEvent
+{
+    public int OrderId { get; set; }
+    public DateTime ProcessedAt { get; set; }
+}
+
+
+
+using SupplierInventoryService.Entities;
+
+namespace SupplierInventoryService.Repositories.Interfaces;
+
+public interface IStockReservationRepository
+{
+    // Tracked entities — caller mutates Status directly and saves via the shared DbContext.
+    // Returns all ACTIVE reservations for this PaymentIntent (one row per drug line item).
+    Task<List<StockReservation>> GetActiveByPaymentIntentIdAsync(int paymentIntentId);
+
+    Task SaveChangesAsync();
+}
+
+
+using Microsoft.EntityFrameworkCore;
+using SupplierInventoryService.Data;
+using SupplierInventoryService.Entities;
+using SupplierInventoryService.Enums;
+using SupplierInventoryService.Repositories.Interfaces;
+
+namespace SupplierInventoryService.Repositories.Implementations;
+
+public class StockReservationRepository : IStockReservationRepository
+{
+    private readonly SupplierInventoryDbContext _context;
+
+    public StockReservationRepository(SupplierInventoryDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<List<StockReservation>> GetActiveByPaymentIntentIdAsync(int paymentIntentId)
+    {
+        return await _context.StockReservations
+            .Where(r => r.PaymentIntentId == paymentIntentId && r.Status == StockReservationStatus.ACTIVE)
+            .ToListAsync();
+    }
+
+    public Task SaveChangesAsync() => _context.SaveChangesAsync();
+}
+
+
+
+
+using SupplierInventoryService.Entities;
+
+namespace SupplierInventoryService.Repositories.Interfaces;
+
+public interface ISalesRepository
+{
+    // Does NOT call SaveChangesAsync internally — same convention as every other repo here.
+    Task AddAsync(Sale sale);
+    Task SaveChangesAsync();
+}
+
+
+
+
+
+
+using SupplierInventoryService.Data;
+using SupplierInventoryService.Entities;
+using SupplierInventoryService.Repositories.Interfaces;
+
+namespace SupplierInventoryService.Repositories.Implementations;
+
+public class SalesRepository : ISalesRepository
+{
+    private readonly SupplierInventoryDbContext _context;
+
+    public SalesRepository(SupplierInventoryDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task AddAsync(Sale sale) => await _context.Sales.AddAsync(sale);
+
+    public Task SaveChangesAsync() => _context.SaveChangesAsync();
+}
+
+
+
+using SupplierInventoryService.Entities;
+
+namespace SupplierInventoryService.Repositories.Interfaces;
+
+public interface IProcessedEventRepository
+{
+    // order_id is the PK — this is the idempotency check itself, not a generic lookup.
+    Task<bool> ExistsAsync(int orderId);
+    Task AddAsync(ProcessedEvent processedEvent);
+    Task SaveChangesAsync();
+}
+
+
+
+using Microsoft.EntityFrameworkCore;
+using SupplierInventoryService.Data;
+using SupplierInventoryService.Entities;
+using SupplierInventoryService.Repositories.Interfaces;
+
+namespace SupplierInventoryService.Repositories.Implementations;
+
+public class ProcessedEventRepository : IProcessedEventRepository
+{
+    private readonly SupplierInventoryDbContext _context;
+
+    public ProcessedEventRepository(SupplierInventoryDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<bool> ExistsAsync(int orderId) =>
+        await _context.ProcessedEvents.AnyAsync(e => e.OrderId == orderId);
+
+    public async Task AddAsync(ProcessedEvent processedEvent) =>
+        await _context.ProcessedEvents.AddAsync(processedEvent);
+
+    public Task SaveChangesAsync() => _context.SaveChangesAsync();
+}
+
+
+
+namespace SupplierInventoryService.Services;
+
+public interface IInternalService
+{
+    Task CommitSaleAsync(int orderId, int paymentIntentId, decimal amount);
+    Task ReleaseReservationAsync(int paymentIntentId);
+}
+
+
+
+
+using SupplierInventoryService.Entities;
+using SupplierInventoryService.Enums;
+using SupplierInventoryService.Exceptions;
+using SupplierInventoryService.Repositories.Interfaces;
+
+namespace SupplierInventoryService.Services;
+
+public class InternalService : IInternalService
+{
+    private readonly IStockReservationRepository _reservationRepository;
+    private readonly ISalesRepository _salesRepository;
+    private readonly IProcessedEventRepository _processedEventRepository;
+    private readonly IDrugRepository _drugRepository;
+
+    public InternalService(
+        IStockReservationRepository reservationRepository,
+        ISalesRepository salesRepository,
+        IProcessedEventRepository processedEventRepository,
+        IDrugRepository drugRepository)
+    {
+        _reservationRepository = reservationRepository;
+        _salesRepository = salesRepository;
+        _processedEventRepository = processedEventRepository;
+        _drugRepository = drugRepository;
+    }
+
+    // Idempotent by design: if this orderId is already in ProcessedEvents, it's a retried
+    // pickup call (e.g. OrderService's own SaveChangesAsync failed after this succeeded once
+    // before) — return success without re-committing reservations or inserting a duplicate Sale.
+    public async Task CommitSaleAsync(int orderId, int paymentIntentId, decimal amount)
+    {
+        if (await _processedEventRepository.ExistsAsync(orderId))
+            return; // already processed — no-op, not an error
+
+        var activeReservations = await _reservationRepository.GetActiveByPaymentIntentIdAsync(paymentIntentId);
+        if (activeReservations.Count == 0)
+            throw new NotFoundException($"No ACTIVE StockReservation found for PaymentIntent {paymentIntentId}.");
+
+        foreach (var reservation in activeReservations)
+            reservation.Status = StockReservationStatus.COMMITTED;
+
+        await _salesRepository.AddAsync(new Sale
+        {
+            OrderId = orderId,
+            Amount = amount,
+            SaleDate = DateTime.UtcNow
+        });
+
+        await _processedEventRepository.AddAsync(new ProcessedEvent
+        {
+            OrderId = orderId,
+            ProcessedAt = DateTime.UtcNow
+        });
+
+        // Single save across all three repos' pending changes (same DbContext instance).
+        await _processedEventRepository.SaveChangesAsync();
+    }
+
+    // 404 here is deliberate, not swallowed — OrderService's ReleaseReservationAsync already
+    // treats 404 as a no-op on its side, so "nothing ACTIVE to release" (already released,
+    // or never existed) is safe to surface honestly rather than pretending to succeed here too.
+    public async Task ReleaseReservationAsync(int paymentIntentId)
+    {
+        var activeReservations = await _reservationRepository.GetActiveByPaymentIntentIdAsync(paymentIntentId);
+        if (activeReservations.Count == 0)
+            throw new NotFoundException($"No ACTIVE StockReservation found for PaymentIntent {paymentIntentId}.");
+
+        foreach (var reservation in activeReservations)
+        {
+            reservation.Status = StockReservationStatus.RELEASED;
+
+            var drug = await _drugRepository.GetByIdAsync(reservation.DrugId)
+                ?? throw new NotFoundException($"Drug {reservation.DrugId} referenced by reservation not found.");
+            drug.QuantityInStock += reservation.Quantity;
+        }
+
+        await _reservationRepository.SaveChangesAsync();
+    }
+}
+
+
+
+
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using SupplierInventoryService.Auth;
+using SupplierInventoryService.DTOs;
+using SupplierInventoryService.Services;
+
+namespace SupplierInventoryService.Controllers;
+
+[ApiController]
+[Route("internal")]
+[Authorize(AuthenticationSchemes = ApiKeyAuthenticationOptions.SchemeName)]
+public class InternalController : ControllerBase
+{
+    private readonly IInternalService _internalService;
+
+    public InternalController(IInternalService internalService)
+    {
+        _internalService = internalService;
+    }
+
+    [HttpPost("sales/commit")]
+    public async Task<IActionResult> CommitSale([FromBody] CommitSaleRequest request)
+    {
+        await _internalService.CommitSaleAsync(request.OrderId, request.PaymentIntentId, request.Amount);
+        return Ok();
+    }
+
+    [HttpPost("reservations/{paymentIntentId}/release")]
+    public async Task<IActionResult> ReleaseReservation(int paymentIntentId)
+    {
+        await _internalService.ReleaseReservationAsync(paymentIntentId);
+        return Ok();
+    }
+}
+
+
+
+
+
+
+
+
