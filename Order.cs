@@ -1,40 +1,33 @@
-public async Task<List<(int, string, decimal)>> ReserveStockAsync(
+ public async Task<List<(int, string, decimal)>> ReserveStockAsync(
     int paymentIntentId, List<(int DrugId, int Quantity)> items)
 {
-    var drugs = new List<(Drug Drug, int Quantity)>();
-
-    foreach (var (drugId, quantity) in items)
+    var payload = new
     {
-        var drug = await _drugRepository.GetByIdAsync(drugId)
-            ?? throw new NotFoundException($"Drug {drugId} not found.");
+        PaymentIntentId = paymentIntentId,
+        Items = items.Select(i => new { DrugId = i.DrugId, Quantity = i.Quantity })
+    };
+    var response = await _httpClient.PostAsJsonAsync("/internal/stock/reserve", payload);
 
-        if (!drug.IsActive)
-            throw new AppValidationException("drugId", $"Drug {drugId} is no longer available.");
-
-        if (drug.QuantityInStock < quantity)
-            throw new InsufficientStockException($"Insufficient stock for drug {drugId}.");
-
-        drugs.Add((drug, quantity));
-    }
-
-    var results = new List<(int, string, decimal)>();
-    foreach (var (drug, quantity) in drugs)
+    if (!response.IsSuccessStatusCode)
     {
-        drug.QuantityInStock -= quantity;
-
-        await _reservationRepository.AddAsync(new StockReservation
+        switch ((int)response.StatusCode)
         {
-            PaymentIntentId = paymentIntentId,
-            DrugId = drug.Id,
-            Quantity = quantity,
-            Status = StockReservationStatus.ACTIVE.ToString(),
-            ReservedAt = DateTime.UtcNow,
-            ExpiresAt = DateTime.UtcNow.AddMinutes(15) // placeholder, same as the never-locked stale-order threshold
-        });
-
-        results.Add((drug.Id, drug.Name, drug.Price));
+            case 404:
+                throw new NotFoundException("One or more drugs in the order were not found.");
+            case 409:
+                throw new StockUnavailableException("One or more items are out of stock.");
+            case 400:
+                throw new AppValidationException(new Dictionary<string, string[]>
+                    { ["items"] = new[] { "Invalid stock reservation request." } });
+            default:
+                response.EnsureSuccessStatusCode();
+                break;
+        }
     }
 
-    await _reservationRepository.SaveChangesAsync();
-    return results;
+    var result = await response.Content.ReadFromJsonAsync<ReserveStockResponseDto>();
+    return result!.Items.Select(i => (i.DrugId, i.DrugName, i.UnitPrice)).ToList();
 }
+
+private record ReserveStockResponseDto(List<ReserveStockResponseItemDto> Items);
+private record ReserveStockResponseItemDto(int DrugId, string DrugName, decimal UnitPrice);
