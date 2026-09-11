@@ -1,28 +1,40 @@
-public async Task<OrderResponse> CancelOrderAsync(int id, CancelledBy cancelledBy, int? requestingDoctorId)
+public async Task<List<(int, string, decimal)>> ReserveStockAsync(
+    int paymentIntentId, List<(int DrugId, int Quantity)> items)
 {
-    var order = await _orderRepository.GetByIdAsync(id)
-        ?? throw new NotFoundException($"Order {id} not found.");
+    var drugs = new List<(Drug Drug, int Quantity)>();
 
-    // Anti-enumeration — same NotFoundException as a genuinely missing id, same
-    // convention as GetOrderByIdAsync, so a Doctor can't distinguish "not mine" from "doesn't exist."
-    if (requestingDoctorId.HasValue && order.DoctorId != requestingDoctorId.Value)
-        throw new NotFoundException($"Order {id} not found.");
+    foreach (var (drugId, quantity) in items)
+    {
+        var drug = await _drugRepository.GetByIdAsync(drugId)
+            ?? throw new NotFoundException($"Drug {drugId} not found.");
 
-    // If you go with "Doctor can only cancel pre-verification":
-    var allowedStatuses = cancelledBy == CancelledBy.DOCTOR
-        ? new[] { OrderStatus.NEW }
-        : new[] { OrderStatus.NEW, OrderStatus.VERIFIED };
+        if (!drug.IsActive)
+            throw new AppValidationException("drugId", $"Drug {drugId} is no longer available.");
 
-    if (!allowedStatuses.Contains(order.Status))
-        throw new AppValidationException(
-            $"Order {id} cannot be cancelled from status {order.Status} by {cancelledBy}.");
+        if (drug.QuantityInStock < quantity)
+            throw new InsufficientStockException($"Insufficient stock for drug {drugId}.");
 
-    await _supplierInventoryClient.ReleaseReservationAsync(order.PaymentIntentId);
+        drugs.Add((drug, quantity));
+    }
 
-    order.Status = OrderStatus.CANCELLED;
-    order.CancelledAt = DateTime.UtcNow;
-    order.CancelledBy = cancelledBy;
-    await _orderRepository.SaveChangesAsync();
+    var results = new List<(int, string, decimal)>();
+    foreach (var (drug, quantity) in drugs)
+    {
+        drug.QuantityInStock -= quantity;
 
-    return ToOrderResponse(order);
+        await _reservationRepository.AddAsync(new StockReservation
+        {
+            PaymentIntentId = paymentIntentId,
+            DrugId = drug.Id,
+            Quantity = quantity,
+            Status = StockReservationStatus.ACTIVE.ToString(),
+            ReservedAt = DateTime.UtcNow,
+            ExpiresAt = DateTime.UtcNow.AddMinutes(15) // placeholder, same as the never-locked stale-order threshold
+        });
+
+        results.Add((drug.Id, drug.Name, drug.Price));
+    }
+
+    await _reservationRepository.SaveChangesAsync();
+    return results;
 }
